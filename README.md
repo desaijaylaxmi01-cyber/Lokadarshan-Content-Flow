@@ -16,6 +16,20 @@ Roles: **cameraman** (upload only), **journalist**, **video_editor** (video desk
 
 **Install on a phone:** open the site in Chrome on Android, then tap ⋮ → *Add to Home screen* / *Install app*. On iPhone, open it in Safari, then tap Share → *Add to Home Screen*.
 
+## Run it on your own computer (local copy)
+
+**Windows:**
+1. On GitHub, click **Code → Download ZIP**, then unzip it, for example to `C:\Newsdesk`.
+2. Double-click **`start-windows.bat`**. On the first run it installs Node.js and ffmpeg (using *winget*) and asks you to double-click it once more. It then installs the app, starts it, and opens **http://localhost:3000** in your browser.
+3. Sign in with `admin@newsdesk.local` / `changeme123` and change the password.
+4. If Windows Firewall asks, click **Allow on private networks**, so phones on the office Wi-Fi can open the address shown in the black window (for example `http://192.168.1.20:3000`).
+
+**Mac:** double-click **`start-mac.command`** (if macOS blocks it: right-click → Open). It needs Node.js 22+ from nodejs.org. ffmpeg is installed with Homebrew if available.
+
+Keep the black window open while people use Newsdesk; closing it stops the app. Everything, including the database and uploaded videos, is stored in the `data` folder next to the start file, so back that folder up. For English translation, open the `.env` file in Notepad and paste your key after `ANTHROPIC_API_KEY=`, then restart.
+
+Limitations of a local copy: only people on the same Wi-Fi can reach it, it stops when the computer is off or asleep, and phones cannot record voiceovers in the browser without https (reporters upload a recording from their voice recorder app instead). For field staff, use the server install below.
+
 ## Run it
 
 Requires Node.js 22 or later and ffmpeg (`sudo apt install ffmpeg`).

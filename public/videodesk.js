@@ -10,7 +10,8 @@ export function renderVoiceover(el, story, locked, onChange) {
   const canRecord = Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder && window.isSecureContext);
   el.innerHTML = `
     <div class="panel-head" style="margin:0"><h2 style="margin:0">🎙️ Voiceover <span class="hint" style="font-weight:400">for Instagram &amp; YouTube</span></h2></div>
-    <p class="hint" style="margin:0">Read the script aloud in a quiet place, holding the phone about a hand's length away.</p>
+    <p class="hint" style="margin:0">Read the script aloud in a quiet place, holding the phone about a hand's length away.
+      ${!locked && !canRecord ? 'Recording here needs a secure (https) connection. Record with your phone\'s voice recorder app, then tap <strong>Upload audio</strong>.' : ''}</p>
     ${locked ? '' : `<div class="row">
       ${canRecord ? '<button class="primary" data-rec>● Record</button>' : ''}
       <label class="btn" style="margin:0">⬆ Upload audio<input type="file" accept="audio/*" hidden data-file></label>

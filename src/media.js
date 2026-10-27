@@ -15,7 +15,9 @@ export const assetPath = (file) => path.join(ASSET_DIR, file);
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
-    const p = spawn('nice', ['-n', '10', cmd, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Low priority on Linux/Mac so video work doesn't slow the app; Windows has no `nice`.
+    const [bin, argv] = process.platform === 'win32' ? [cmd, args] : ['nice', ['-n', '10', cmd, ...args]];
+    const p = spawn(bin, argv, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let out = '', err = '';
     p.stdout.on('data', (d) => { out += d; });
     p.stderr.on('data', (d) => { err = (err + d).slice(-2000); });

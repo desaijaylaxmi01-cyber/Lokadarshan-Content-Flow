@@ -1,8 +1,10 @@
+import './env.js';
 import express from 'express';
 import multer from 'multer';
 import archiver from 'archiver';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, UPLOAD_DIR, ASSET_DIR, PARTIAL_DIR, getSetting, setSetting } from './db.js';
@@ -760,8 +762,17 @@ app.use((err, _req, res, _next) => {
 
 startMediaWorker();
 
+function lanAddresses() {
+  return Object.values(os.networkInterfaces()).flat()
+    .filter((n) => n && n.family === 'IPv4' && !n.internal).map((n) => n.address);
+}
+
 const port = Number(process.env.PORT || 3000);
 if (process.env.NODE_ENV !== 'test') {
-  app.listen(port, () => console.log(`Newsdesk running at http://localhost:${port}`));
+  app.listen(port, () => {
+    console.log(`\nNewsdesk is running.\n  On this computer:   http://localhost:${port}`);
+    for (const ip of lanAddresses()) console.log(`  Phones on same Wi-Fi: http://${ip}:${port}`);
+    console.log('\nKeep this window open while people are using Newsdesk.\n');
+  });
 }
 export default app;
