@@ -190,7 +190,8 @@ dialog::backdrop { background: rgba(0,0,0,.4); }
 .frame-strip .frame { flex: none; padding: 0; border: 3px solid transparent; border-radius: 9px; background: none; display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 11px; color: var(--muted); }
 .frame-strip .frame img { height: 84px; }
 .frame-strip .frame.chosen { border-color: var(--ok); color: var(--ok); }
-.frame-strip .frame.chosen span::before { content: '✓ Main photo · '; font-weight: 700; }
+.frame-strip .frame span { width: 0; min-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
+.frame-strip .frame.chosen span { font-weight: 700; }
 .linked { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; display: flex; flex-direction: column; gap: 10px; }
 
 dialog.wide { width: min(1000px, 96vw); }

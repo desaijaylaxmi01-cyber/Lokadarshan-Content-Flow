@@ -223,10 +223,10 @@ export function renderLinked(el, story, locked, onChange) {
         ${locked ? '' : `<button data-grab="${a.id}">📸 Use this moment as main photo</button>`}
         <div class="hint">Or tap a screenshot:</div>
         <div class="frame-strip pick">${a.frames.map((f) => `<button class="frame ${picked('frame', f.id) ? 'chosen' : ''}" data-frame="${f.id}" ${locked ? 'disabled' : ''}>
-          <img src="/api/frames/${f.id}/file" alt="Screenshot at ${fmtDuration(f.t)}" loading="lazy"><span>${f.custom ? '📸 ' : ''}${fmtDuration(f.t)}</span></button>`).join('')}</div>` : ''}
+          <img src="/api/frames/${f.id}/file" alt="Screenshot at ${fmtDuration(f.t)}"><span>${picked('frame', f.id) ? '✓ Main' : (f.custom ? '📸 ' : '') + fmtDuration(f.t)}</span></button>`).join('')}</div>` : ''}
       ${a.status === 'ready' && a.kind === 'image' ? `
         <div class="frame-strip pick"><button class="frame ${picked('asset', a.id) ? 'chosen' : ''}" data-photo="${a.id}" ${locked ? 'disabled' : ''}>
-          <img src="/api/assets/${a.id}/web" alt=""><span>Use as main photo</span></button></div>` : ''}
+          <img src="/api/assets/${a.id}/web" alt=""><span>${picked('asset', a.id) ? '✓ Main photo' : 'Use as main photo'}</span></button></div>` : ''}
     </div>`).join('')}`;
 
   el.onclick = async (e) => {
@@ -252,5 +252,15 @@ export function renderLinked(el, story, locked, onChange) {
       });
     }
   };
+  // Bring the chosen screenshot into view inside its strip.
+  for (const chosen of el.querySelectorAll('.frame.chosen')) {
+    const strip = chosen.parentElement;
+    const center = () => {
+      const c = chosen.getBoundingClientRect(), s = strip.getBoundingClientRect();
+      strip.scrollLeft += c.left + c.width / 2 - (s.left + s.width / 2);
+    };
+    const images = [...strip.querySelectorAll('img')];
+    Promise.all(images.map((i) => i.complete ? null : new Promise((r) => { i.onload = i.onerror = r; }))).then(center);
+  }
   if (processing) setTimeout(() => document.body.contains(el) && onChange(), 5000);
 }
