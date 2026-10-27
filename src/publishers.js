@@ -25,7 +25,7 @@ export function articleFor(story, lang) {
   };
 }
 
-const filePath = (m) => path.join(UPLOAD_DIR, m.stored_name);
+const filePath = (m) => m.path || path.join(UPLOAD_DIR, m.stored_name);
 
 async function dryrun(site, story, article, media, opts) {
   const file = path.join(OUTBOX_DIR, `${site.key}-story${story.id}-${article.language}-${Date.now()}.json`);

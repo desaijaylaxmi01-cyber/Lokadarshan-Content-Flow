@@ -3,6 +3,7 @@
 set -euo pipefail
 APP_DIR=/opt/newsdesk
 cd "$APP_DIR"
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg >/dev/null
 sudo -u newsdesk git pull --ff-only
 sudo -u newsdesk npm ci --omit=dev
 systemctl restart newsdesk

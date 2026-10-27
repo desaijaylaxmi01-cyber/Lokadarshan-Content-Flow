@@ -25,7 +25,7 @@ fi
 echo "==> Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl git nginx certbot python3-certbot-nginx ufw ca-certificates
+apt-get install -y curl git nginx certbot python3-certbot-nginx ufw ca-certificates ffmpeg
 
 if ! command -v node >/dev/null || [[ "$(node -p 'process.versions.node.split(".")[0]')" -lt 22 ]]; then
   echo "==> Installing Node.js 22"
@@ -55,6 +55,7 @@ ADMIN_EMAIL=${EMAIL}
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
 PORT=3000
 MAX_UPLOAD_MB=${MAX_UPLOAD_MB}
+ORIGINAL_RETENTION_DAYS=7
 DATA_DIR=${DATA_DIR}
 EOF
   NEW_INSTALL=1

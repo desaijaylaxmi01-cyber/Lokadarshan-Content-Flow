@@ -1,16 +1,21 @@
 # Newsdesk — reporter upload & publishing portal
 
-A web portal for the Lokadarshan News and Belagavi Insider newsroom.
+A phone-first web app for the Lokadarshan News and Belagavi Insider newsroom. Staff can install it on their home screen like an app.
 
-1. **Reporters** sign in, write or paste the story script (Kannada, Marathi, Hindi, Urdu, Konkani or English), and upload photos, audio, video and data files (PDF, Excel, CSV and similar). Uploads support drag and drop, show progress and take files up to 2 GB each.
-2. **Translate to English**: one click produces an English headline, summary and story with Claude. The translation can be edited before publishing.
-3. **Submit for review**: an editor checks the story, then either returns it to the reporter with a note or publishes it.
-4. **Publish**: pick the websites, choose the language for each one (for example, Lokadarshan in Kannada and Belagavi Insider in English), and choose whether to publish live or save as a draft. Text, photos, audio, video and documents all go to each site's backend.
-5. Every publish attempt is logged on the story, with a link to the live post or the error message.
+1. **Cameramen** open *Upload*, then record a video, take a photo or pick from the gallery, adding a one-line note and the place. Uploads go up in 8 MB pieces. If the signal drops, the upload waits and continues by itself, and the screen stays awake until it finishes.
+2. **The server** compresses each video to a 720p web version and takes **10 screenshots** from it. Camera originals are deleted after `ORIGINAL_RETENTION_DAYS` (7 by default); web versions are kept.
+3. **Reporters** open the *Media library*, tag the right video for the story, and tap the best screenshot as the main photo. They can also pause the video and use that exact moment. They write or paste the **headline and script**; *Copy a ready-made prompt* builds a prompt for ChatGPT, Gemini or Claude from the cameraman's notes. Then they add the **Instagram caption, keywords and hashtags**.
+4. **Translate to English** with one click (Claude), then review the result.
+5. **Editors** review, then **publish**. For example, Lokadarshan gets the Kannada story with the main photo and video, and Belagavi Insider gets the English story with the main photo only. Each site can be set to send everything or only the main photo.
+6. *Copy caption + hashtags* and the video download button help with posting to Instagram.
+
+Roles: **cameraman** (upload only), **journalist**, **editor** (also publishes), **admin** (also team, websites and storage).
+
+**Install on a phone:** open the site in Chrome on Android, then tap ⋮ → *Add to Home screen* / *Install app*. On iPhone, open it in Safari, then tap Share → *Add to Home Screen*.
 
 ## Run it
 
-Requires Node.js 22 or later.
+Requires Node.js 22 or later and ffmpeg (`sudo apt install ffmpeg`).
 
 ```bash
 npm install
@@ -42,6 +47,7 @@ Click **Save & test connection** to check the credentials before going live.
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | First admin account, created on first start only |
 | `PORT` | Defaults to 3000 |
 | `MAX_UPLOAD_MB` | Per-file limit; defaults to 2048 |
+| `ORIGINAL_RETENTION_DAYS` | Days to keep camera-original videos and photos (web versions are kept); defaults to 7 |
 | `DATA_DIR` | Where the database and uploads live; defaults to `./data` |
 
 ## Deploying
@@ -64,6 +70,7 @@ The script installs Node.js 22 and Nginx, gets a free HTTPS certificate, runs th
 ```
 src/server.js      HTTP API (auth, stories, uploads, translate, publish, admin)
 src/publishers.js  Test mode / WordPress / custom-CRM connectors
+src/media.js       Video compression, screenshots, cleanup of old originals (ffmpeg)
 src/translate.js   Claude translation to English
 src/db.js          SQLite schema and first-run seed
 public/            Browser app (plain HTML/CSS/JS)

@@ -1,42 +1,9 @@
 // Newsdesk front end — plain JS, hash routing.
+import { esc, api, toast, fmtSize, fmtDate, badge, CATEGORIES, guard, setUnauthorizedHandler } from './lib.js';
+import { renderUpload, renderLibrary, renderLinked } from './library.js';
 const $app = document.getElementById('app');
 let me = null;
-
-// ---------- helpers ----------
-
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
-async function api(path, opts = {}) {
-  const init = { method: opts.method || 'GET', headers: {} };
-  if (opts.body !== undefined) {
-    init.headers['Content-Type'] = 'application/json';
-    init.body = JSON.stringify(opts.body);
-  }
-  const res = await fetch('/api' + path, init);
-  const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && path !== '/login') { me = null; renderLogin(); throw new Error(data.error || 'Signed out'); }
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-  return data;
-}
-
-function toast(msg, isError = false) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'show' + (isError ? ' error' : '');
-  clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => (t.className = ''), isError ? 6000 : 3000);
-}
-
-const fmtSize = (n) => n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.ceil(n / 1e3) + ' KB';
-const fmtDate = (s) => s ? new Date(s.replace(' ', 'T') + (s.endsWith('Z') ? '' : 'Z')).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : '';
-const badge = (status) => `<span class="badge ${status}">${status}</span>`;
-const CATEGORIES = ['Belagavi', 'Karnataka', 'India', 'Politics', 'Crime', 'Agriculture', 'Education', 'Health', 'Business', 'Sports', 'Entertainment', 'Weather', 'Civic issues'];
-
-async function guard(btn, fn) {
-  const label = btn?.innerHTML;
-  if (btn) { btn.disabled = true; }
-  try { return await fn(); } catch (e) { toast(e.message, true); } finally { if (btn) { btn.disabled = false; btn.innerHTML = label; } }
-}
+setUnauthorizedHandler(() => { me = null; renderLogin(); });
 
 // ---------- shell ----------
 
@@ -46,7 +13,9 @@ async function boot() {
   } catch { return; }
   document.getElementById('topbar').hidden = false;
   document.getElementById('user-name').textContent = `${me.user.name} · ${me.user.role}`;
+  const camera = me.user.role === 'cameraman';
   document.getElementById('nav-admin').hidden = me.user.role !== 'admin';
+  for (const n of ['stories', 'library', 'new']) document.querySelector(`[data-nav=${n}]`).hidden = camera;
   route();
 }
 
@@ -92,10 +61,13 @@ document.getElementById('btn-password').onclick = () => {
 
 function route() {
   if (!me) return;
-  const hash = location.hash.slice(1) || '/';
-  const nav = hash.startsWith('/admin') ? 'admin' : hash === '/new' ? 'new' : 'stories';
+  let hash = location.hash.slice(1) || '/';
+  if (me.user.role === 'cameraman') hash = '/upload';
+  const nav = { '/admin': 'admin', '/new': 'new', '/upload': 'upload', '/library': 'library' }[hash] || 'stories';
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === nav));
   const m = hash.match(/^\/story\/(\d+)/);
+  if (hash === '/upload') return renderUpload($app);
+  if (hash === '/library') return renderLibrary($app, me);
   if (hash === '/new') return newStory();
   if (m) return renderEditor(Number(m[1]));
   if (hash === '/admin' && me.user.role === 'admin') return renderAdmin();
@@ -144,13 +116,15 @@ async function loadList() {
     el.innerHTML = `<div class="empty">No stories here yet. <a href="#/new">Start a new story</a>.</div>`;
     return;
   }
-  el.innerHTML = `<table><thead><tr><th>Story</th><th class="hide-sm">Reporter</th><th>Status</th><th class="hide-sm">Files</th><th class="hide-sm">Updated</th></tr></thead><tbody>
+  el.innerHTML = `<table><thead><tr><th class="thumb-col"></th><th>Story</th><th class="hide-sm">Reporter</th><th>Status</th><th class="hide-sm">Files</th><th class="hide-sm">Updated</th></tr></thead><tbody>
     ${stories.map((s) => `<tr data-id="${s.id}">
+      <td class="thumb-col">${s.featured_frame_id ? `<img src="/api/frames/${s.featured_frame_id}/file" alt="" loading="lazy">`
+        : s.featured_asset_id ? `<img src="/api/assets/${s.featured_asset_id}/web" alt="" loading="lazy">` : '<div class="no-thumb"></div>'}</td>
       <td><div class="story-title">${esc(s.title || '(untitled)')}</div>
         <div class="story-sub">${s.en_title ? 'EN: ' + esc(s.en_title) : 'Not translated'}${s.category ? ' · ' + esc(s.category) : ''}</div></td>
       <td class="hide-sm">${esc(s.author_name)}</td>
       <td>${badge(s.status)}</td>
-      <td class="hide-sm">${s.media_count}</td>
+      <td class="hide-sm">${s.media_count + s.asset_count}</td>
       <td class="hide-sm story-sub">${fmtDate(s.updated_at)}</td></tr>`).join('')}
   </tbody></table>`;
   el.querySelector('tbody').onclick = (e) => {
@@ -189,6 +163,7 @@ async function renderEditor(id) {
 
     <div class="editor-layout">
       <div class="stack">
+        <section class="card stack" id="linked"></section>
         <div class="grid-2">
           <section class="card lang-panel orig stack">
             <div class="panel-head"><h2>Original script</h2>
@@ -196,6 +171,7 @@ async function renderEditor(id) {
             <div><label>Headline</label><input type="text" data-f="title" value="${esc(story.title)}" ${ro}></div>
             <div><label>Summary / standfirst</label><textarea data-f="summary" rows="2" ${ro}>${esc(story.summary)}</textarea></div>
             <div><label>Story script</label><textarea class="script" data-f="body" ${ro} placeholder="Type or paste the full story here…">${esc(story.body)}</textarea></div>
+            ${locked ? '' : `<div class="hint">Writing with ChatGPT, Gemini or Claude? <button class="link" id="btn-ai-prompt" style="color:var(--info)">Copy a ready-made prompt</button>, paste it there, then paste the answer back here.</div>`}
           </section>
           <section class="card lang-panel en stack">
             <div class="panel-head"><h2>English version</h2>
@@ -208,7 +184,7 @@ async function renderEditor(id) {
         </div>
 
         <section class="card stack">
-          <h2>Photos, audio, video &amp; data</h2>
+          <h2>Other files <span class="hint" style="font-weight:400">— documents, data, audio, extra photos</span></h2>
           ${locked ? '' : `<div class="dropzone" id="dropzone">
             <strong>Drop files here</strong> or click to choose<br>
             <span class="hint">Photos, audio clips, video, PDFs, spreadsheets, CSV/data files</span>
@@ -226,6 +202,13 @@ async function renderEditor(id) {
             <datalist id="cats">${CATEGORIES.map((c) => `<option value="${c}">`).join('')}</datalist></div>
           <div><label>Tags</label><input type="text" data-f="tags" value="${esc(story.tags)}" placeholder="comma, separated" ${ro}></div>
           <div><label>Dateline / location</label><input type="text" data-f="location" value="${esc(story.location)}" placeholder="e.g. Belagavi" ${ro}></div>
+        </section>
+        <section class="card stack">
+          <h2>Instagram &amp; social</h2>
+          <div><label>Instagram caption</label><textarea data-f="ig_caption" rows="3" ${ro}>${esc(story.ig_caption)}</textarea></div>
+          <div><label>Keywords</label><input type="text" data-f="keywords" value="${esc(story.keywords)}" placeholder="belagavi rain, gokak falls" ${ro}></div>
+          <div><label>Hashtags</label><input type="text" data-f="hashtags" value="${esc(story.hashtags)}" placeholder="#Belagavi #Karnataka" ${ro}></div>
+          <div class="row"><button id="btn-copy-ig">📋 Copy caption + hashtags</button></div>
         </section>
         <section class="card stack" id="workflow"></section>
         ${story.publications.length ? `<section class="card"><h2>Publishing history</h2><ul class="history" style="padding-left:18px;margin:0">
@@ -251,6 +234,39 @@ async function renderEditor(id) {
 
   renderMedia(story, locked);
   renderWorkflow(story, sites, editor);
+  const linkedEl = document.getElementById('linked');
+  const refreshLinked = async () => {
+    await flush(id);
+    const fresh = await api(`/stories/${id}`);
+    Object.assign(story, { assets: fresh.assets, featured_frame_id: fresh.featured_frame_id, featured_asset_id: fresh.featured_asset_id });
+    if (document.body.contains(linkedEl)) renderLinked(linkedEl, story, locked, refreshLinked);
+  };
+  renderLinked(linkedEl, story, locked, refreshLinked);
+
+  document.getElementById('btn-copy-ig').onclick = () => {
+    const v = (f) => $app.querySelector(`[data-f=${f}]`).value.trim();
+    copyText([v('ig_caption') || v('title'), v('hashtags')].filter(Boolean).join('\n\n'), 'Caption copied — paste it in Instagram');
+  };
+  document.getElementById('btn-ai-prompt')?.addEventListener('click', () => {
+    const v = (f) => $app.querySelector(`[data-f=${f}]`).value.trim();
+    const facts = story.assets.map((a) => [a.note, a.location].filter(Boolean).join(' — ')).filter(Boolean);
+    const lang = me.languages[v('source_lang')] || 'Kannada';
+    copyText(`You are a news reporter for Lokadarshan News, a ${lang} news website in Belagavi, Karnataka.
+Write a news story in ${lang} from the facts below. Use only these facts; do not invent names, numbers or quotes.
+
+Give me:
+1. Headline (${lang})
+2. News script (${lang}, 4–8 short paragraphs)
+3. Instagram caption (${lang}, 2–3 lines)
+4. 5 SEO keywords (English)
+5. 10 Instagram hashtags
+
+Place: ${v('location') || '[place]'}
+Date: ${new Date().toLocaleDateString('en-IN', { dateStyle: 'long' })}
+Facts / cameraman notes:
+${facts.length ? facts.map((f) => '- ' + f).join('\n') : '- [write what happened, who, when, where]'}
+${v('body') ? '\nMy draft so far:\n' + v('body') : ''}`, 'Prompt copied — paste it into ChatGPT, Gemini or Claude');
+  });
 
   document.getElementById('btn-delete')?.addEventListener('click', async () => {
     if (!confirm('Delete this story and all its files? This cannot be undone.')) return;
@@ -276,6 +292,17 @@ async function renderEditor(id) {
   };
 
   if (!locked) setupUpload(id);
+}
+
+async function copyText(text, message) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(message);
+  } catch {
+    const d = document.createElement('textarea');
+    d.value = text; document.body.append(d); d.select(); document.execCommand('copy'); d.remove();
+    toast(message);
+  }
 }
 
 async function flush(id) {
@@ -379,6 +406,8 @@ function renderWorkflow(story, sites, editor) {
           <select data-lang><option value="original" ${s.default_lang === 'original' ? 'selected' : ''}>Original language</option>
             <option value="en" ${s.default_lang === 'en' ? 'selected' : ''}>English</option></select>
           <select data-status><option value="publish">Publish live</option><option value="draft">Save as draft</option></select>
+          <select data-media><option value="all" ${s.default_media !== 'photo' ? 'selected' : ''}>Photo + video + files</option>
+            <option value="photo" ${s.default_media === 'photo' ? 'selected' : ''}>Main photo only</option></select>
         </div></div>`).join('') : '<p class="hint">No websites configured. An admin can add them under Admin.</p>'}
       <button class="primary" id="btn-publish" ${sites.length ? '' : 'disabled'}>Publish selected</button>
       <div id="publish-results" class="stack" style="margin-top:8px"></div>
@@ -409,8 +438,10 @@ function renderWorkflow(story, sites, editor) {
     await flush(story.id);
     const targets = [...el.querySelectorAll('.site-target')].filter((t) => t.querySelector('[data-pick]').checked).map((t) => ({
       siteId: Number(t.dataset.site), lang: t.querySelector('[data-lang]').value, status: t.querySelector('[data-status]').value,
+      media: t.querySelector('[data-media]').value,
     }));
     if (!targets.length) return toast('Choose at least one website.', true);
+    if (!story.featured_frame_id && !story.featured_asset_id && !confirm('No main photo chosen. Publish without a photo from the video?')) return;
     const live = targets.filter((t) => t.status === 'publish').length;
     if (live && !confirm(`Publish this story live on ${live} website(s)?`)) return;
     const btn = e.currentTarget;
@@ -448,7 +479,7 @@ async function renderAdmin() {
         <div style="overflow-x:auto"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Active</th><th></th></tr></thead><tbody id="users">
           ${users.map((u) => `<tr data-id="${u.id}" style="cursor:default">
             <td>${esc(u.name)}</td><td>${esc(u.email)}</td>
-            <td><select data-role style="width:auto">${['journalist', 'editor', 'admin'].map((r) => `<option ${u.role === r ? 'selected' : ''}>${r}</option>`).join('')}</select></td>
+            <td><select data-role style="width:auto">${['cameraman', 'journalist', 'editor', 'admin'].map((r) => `<option ${u.role === r ? 'selected' : ''}>${r}</option>`).join('')}</select></td>
             <td><input type="checkbox" data-active ${u.active ? 'checked' : ''}></td>
             <td><button class="link" data-reset>Reset password</button></td></tr>`).join('')}
         </tbody></table></div>
@@ -456,9 +487,21 @@ async function renderAdmin() {
           <input class="grow" name="name" placeholder="Full name" required>
           <input class="grow" name="email" type="email" placeholder="Email" required>
           <input class="grow" name="password" type="text" placeholder="Temporary password (8+)" minlength="8" required>
-          <select name="role" style="width:auto"><option>journalist</option><option>editor</option><option>admin</option></select>
+          <select name="role" style="width:auto"><option>cameraman</option><option selected>journalist</option><option>editor</option><option>admin</option></select>
           <button class="primary">Add person</button>
         </form>
+      </section>
+
+      <section class="card stack">
+        <h2>Storage</h2>
+        ${settings.ffmpeg ? '' : '<div class="note">ffmpeg is not installed on the server, so videos are not compressed and no screenshots are made. Run the update script to install it.</div>'}
+        <div class="stat-row">
+          <div><div class="stat">${fmtSize(settings.storage.free)}</div><div class="hint">free of ${fmtSize(settings.storage.total)}</div></div>
+          <div><div class="stat">${settings.storage.assets}</div><div class="hint">videos &amp; photos in library</div></div>
+          <div><div class="stat">${fmtSize(settings.storage.web)}</div><div class="hint">compressed web versions</div></div>
+          <div><div class="stat">${fmtSize(settings.storage.originals)}</div><div class="hint">camera originals (deleted after ${settings.storage.retentionDays} days)</div></div>
+        </div>
+        ${settings.storage.free < settings.storage.total * 0.15 ? '<div class="note">Disk is almost full. Lower ORIGINAL_RETENTION_DAYS in the server .env, delete old library items, or move to a bigger plan.</div>' : ''}
       </section>
 
       <section class="card stack">
@@ -481,7 +524,7 @@ async function renderAdmin() {
     const f = e.target;
     const v = (n) => f.elements[n]?.value ?? '';
     const body = {
-      name: v('name'), base_url: v('base_url'), type: v('type'), default_lang: v('default_lang'), enabled: f.elements.enabled.checked,
+      name: v('name'), base_url: v('base_url'), type: v('type'), default_lang: v('default_lang'), default_media: v('default_media'), enabled: f.elements.enabled.checked,
       config: { username: v('username'), appPassword: v('appPassword'), langParam: f.elements.langParam.checked, endpoint: v('endpoint'), token: v('token'), authHeader: v('authHeader') },
     };
     const btn = e.submitter;
@@ -542,6 +585,9 @@ function siteForm(s) {
       <div class="grow"><label>Default language</label><select name="default_lang">
         <option value="original" ${s.default_lang === 'original' ? 'selected' : ''}>Original (e.g. Kannada)</option>
         <option value="en" ${s.default_lang === 'en' ? 'selected' : ''}>English</option></select></div>
+      <div class="grow"><label>Send by default</label><select name="default_media">
+        <option value="all" ${s.default_media !== 'photo' ? 'selected' : ''}>Photo + video + files</option>
+        <option value="photo" ${s.default_media === 'photo' ? 'selected' : ''}>Main photo only</option></select></div>
       <label class="row" style="margin:18px 0 0;color:var(--text)"><input type="checkbox" name="enabled" ${s.enabled ? 'checked' : ''}> Enabled</label>
     </div>
     <div class="row" data-for="wordpress" ${s.type === 'wordpress' ? '' : 'hidden'}>
@@ -559,4 +605,5 @@ function siteForm(s) {
   </form>`;
 }
 
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 boot().catch(() => renderLogin());

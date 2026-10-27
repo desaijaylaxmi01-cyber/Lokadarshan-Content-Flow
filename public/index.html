@@ -4,6 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Newsdesk</title>
+  <meta name="theme-color" content="#b3261e">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Newsdesk">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&family=Noto+Sans+Kannada:wght@400;500;600&family=Noto+Sans+Devanagari:wght@400;500;600&display=swap">
   <link rel="stylesheet" href="/styles.css">
@@ -12,8 +18,10 @@
   <header class="topbar" id="topbar" hidden>
     <a href="#/" class="brand"><span class="brand-mark">ND</span> Newsdesk</a>
     <nav>
+      <a href="#/upload" data-nav="upload">⬆ Upload</a>
+      <a href="#/library" data-nav="library">Library</a>
       <a href="#/" data-nav="stories">Stories</a>
-      <a href="#/new" data-nav="new">+ New story</a>
+      <a href="#/new" data-nav="new">+ New</a>
       <a href="#/admin" data-nav="admin" id="nav-admin" hidden>Admin</a>
     </nav>
     <div class="user">

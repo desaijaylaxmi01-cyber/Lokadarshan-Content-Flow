@@ -4,12 +4,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db, UPLOAD_DIR, getSetting, setSetting } from './db.js';
+import { db, UPLOAD_DIR, ASSET_DIR, PARTIAL_DIR, getSetting, setSetting } from './db.js';
 import {
   COOKIE, createSession, hashPassword, verifyPassword, sessionMiddleware, requireUser, requireRole,
 } from './auth.js';
 import { translateStory, translationAvailable, LANGUAGES } from './translate.js';
 import { publishTo, testConnection } from './publishers.js';
+import { enqueue, grabFrame, assetPath, startMediaWorker, diskUsage, ffmpegAvailable } from './media.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -23,6 +24,8 @@ const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 
 const isEditor = (user) => user.role === 'editor' || user.role === 'admin';
+const requireWriter = requireRole('journalist', 'editor', 'admin');
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048);
 const canPublish = (user) => isEditor(user) || getSetting('journalistsCanPublish', false);
 
 // ---------- Auth ----------
@@ -48,6 +51,7 @@ app.get('/api/me', requireUser, (req, res) => {
     canPublish: canPublish(req.user),
     translationAvailable: translationAvailable(),
     languages: LANGUAGES,
+    maxUploadMb: MAX_UPLOAD_MB,
   });
 });
 
@@ -69,7 +73,7 @@ app.get('/api/users', requireRole('admin'), (_req, res) => {
 app.post('/api/users', requireRole('admin'), h(async (req, res) => {
   const { name, email, password, role } = req.body;
   if (!name || !email || !password || password.length < 8) throw new HttpError(400, 'Name, email and a password of 8+ characters are required.');
-  if (!['journalist', 'editor', 'admin'].includes(role)) throw new HttpError(400, 'Invalid role.');
+  if (!['cameraman', 'journalist', 'editor', 'admin'].includes(role)) throw new HttpError(400, 'Invalid role.');
   try {
     const r = db.prepare('INSERT INTO users (name, email, password_hash, role) VALUES (?,?,?,?)')
       .run(name.trim(), email.trim(), hashPassword(password), role);
@@ -98,7 +102,8 @@ app.patch('/api/users/:id', requireRole('admin'), h(async (req, res) => {
 
 // ---------- Stories ----------
 
-const STORY_FIELDS = ['title', 'summary', 'body', 'source_lang', 'category', 'tags', 'location', 'en_title', 'en_summary', 'en_body'];
+const STORY_FIELDS = ['title', 'summary', 'body', 'source_lang', 'category', 'tags', 'location', 'en_title', 'en_summary', 'en_body',
+  'ig_caption', 'keywords', 'hashtags'];
 
 function loadStory(req) {
   const story = db.prepare(`SELECT s.*, u.name AS author_name FROM stories s JOIN users u ON u.id = s.author_id WHERE s.id = ?`)
@@ -114,7 +119,7 @@ function assertEditable(user, story) {
   }
 }
 
-app.get('/api/stories', requireUser, (req, res) => {
+app.get('/api/stories', requireWriter, (req, res) => {
   const mine = !isEditor(req.user) || req.query.mine === '1';
   const params = [];
   let where = '1=1';
@@ -123,20 +128,24 @@ app.get('/api/stories', requireUser, (req, res) => {
   if (req.query.q) { where += ' AND (s.title LIKE ? OR s.en_title LIKE ?)'; params.push(`%${req.query.q}%`, `%${req.query.q}%`); }
   res.json(db.prepare(`
     SELECT s.id, s.title, s.en_title, s.status, s.category, s.source_lang, s.updated_at, u.name AS author_name,
+      s.featured_frame_id, s.featured_asset_id,
+      (SELECT COUNT(*) FROM story_assets sa WHERE sa.story_id = s.id) AS asset_count,
       (SELECT COUNT(*) FROM media m WHERE m.story_id = s.id) AS media_count,
       (SELECT COUNT(*) FROM publications p WHERE p.story_id = s.id AND p.ok = 1) AS publish_count
     FROM stories s JOIN users u ON u.id = s.author_id
     WHERE ${where} ORDER BY s.updated_at DESC LIMIT 200`).all(...params));
 });
 
-app.post('/api/stories', requireUser, (req, res) => {
+app.post('/api/stories', requireWriter, (req, res) => {
   const r = db.prepare('INSERT INTO stories (author_id, source_lang) VALUES (?, ?)').run(req.user.id, req.body.source_lang || 'kn');
   res.json({ id: Number(r.lastInsertRowid) });
 });
 
-app.get('/api/stories/:id', requireUser, h(async (req, res) => {
+app.get('/api/stories/:id', requireWriter, h(async (req, res) => {
   const story = loadStory(req);
   story.media = db.prepare('SELECT * FROM media WHERE story_id = ? ORDER BY id').all(story.id);
+  story.assets = db.prepare(`SELECT a.*, u.name AS uploader_name FROM story_assets sa JOIN assets a ON a.id = sa.asset_id
+    JOIN users u ON u.id = a.uploader_id WHERE sa.story_id = ? ORDER BY a.id`).all(story.id).map(withFrames);
   story.publications = db.prepare(`
     SELECT p.*, si.name AS site_name, u.name AS published_by_name FROM publications p
     JOIN sites si ON si.id = p.site_id LEFT JOIN users u ON u.id = p.published_by
@@ -144,10 +153,16 @@ app.get('/api/stories/:id', requireUser, h(async (req, res) => {
   res.json(story);
 }));
 
-app.patch('/api/stories/:id', requireUser, h(async (req, res) => {
+app.patch('/api/stories/:id', requireWriter, h(async (req, res) => {
   const story = loadStory(req);
   assertEditable(req.user, story);
   const updates = STORY_FIELDS.filter((f) => typeof req.body[f] === 'string');
+  // Featured picture is either a video screenshot or a library photo, never both.
+  if ('featured_frame_id' in req.body) {
+    db.prepare('UPDATE stories SET featured_frame_id = ?, featured_asset_id = NULL WHERE id = ?').run(req.body.featured_frame_id ?? null, story.id);
+  } else if ('featured_asset_id' in req.body) {
+    db.prepare('UPDATE stories SET featured_asset_id = ?, featured_frame_id = NULL WHERE id = ?').run(req.body.featured_asset_id ?? null, story.id);
+  }
   if (updates.length) {
     db.prepare(`UPDATE stories SET ${updates.map((f) => `${f} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ?`)
       .run(...updates.map((f) => req.body[f]), story.id);
@@ -155,7 +170,7 @@ app.patch('/api/stories/:id', requireUser, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.delete('/api/stories/:id', requireUser, h(async (req, res) => {
+app.delete('/api/stories/:id', requireWriter, h(async (req, res) => {
   const story = loadStory(req);
   if (req.user.role !== 'admin' && !(story.author_id === req.user.id && story.status === 'draft')) {
     throw new HttpError(403, 'Only drafts can be deleted by their author.');
@@ -166,7 +181,7 @@ app.delete('/api/stories/:id', requireUser, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.post('/api/stories/:id/submit', requireUser, h(async (req, res) => {
+app.post('/api/stories/:id/submit', requireWriter, h(async (req, res) => {
   const story = loadStory(req);
   if (!story.title.trim() || !story.body.trim()) throw new HttpError(400, 'Add a headline and the story script before submitting.');
   db.prepare(`UPDATE stories SET status = 'submitted', updated_at = datetime('now') WHERE id = ?`).run(story.id);
@@ -180,7 +195,7 @@ app.post('/api/stories/:id/reject', requireRole('editor', 'admin'), h(async (req
   res.json({ ok: true });
 }));
 
-app.post('/api/stories/:id/translate', requireUser, h(async (req, res) => {
+app.post('/api/stories/:id/translate', requireWriter, h(async (req, res) => {
   const story = loadStory(req);
   assertEditable(req.user, story);
   if (!translationAvailable()) throw new HttpError(503, 'Translation is not configured. Ask the admin to set ANTHROPIC_API_KEY on the server.');
@@ -205,7 +220,7 @@ const upload = multer({
 
 const kindOf = (mime) => (mime.match(/^(image|audio|video)\//)?.[1]) || 'document';
 
-app.post('/api/stories/:id/media', requireUser, (req, res, next) => {
+app.post('/api/stories/:id/media', requireWriter, (req, res, next) => {
   try { assertEditable(req.user, loadStory(req)); } catch (e) { return next(e); }
   next();
 }, upload.array('files'), (req, res) => {
@@ -225,20 +240,20 @@ function loadMedia(req) {
   return { m, story };
 }
 
-app.get('/api/media/:mediaId/file', requireUser, h(async (req, res) => {
+app.get('/api/media/:mediaId/file', requireWriter, h(async (req, res) => {
   const { m } = loadMedia(req);
   res.type(m.mime);
   res.sendFile(path.join(UPLOAD_DIR, m.stored_name), { headers: { 'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(m.original_name)}` } });
 }));
 
-app.patch('/api/media/:mediaId', requireUser, h(async (req, res) => {
+app.patch('/api/media/:mediaId', requireWriter, h(async (req, res) => {
   const { m, story } = loadMedia(req);
   assertEditable(req.user, story);
   db.prepare('UPDATE media SET caption = ? WHERE id = ?').run(String(req.body.caption || ''), m.id);
   res.json({ ok: true });
 }));
 
-app.delete('/api/media/:mediaId', requireUser, h(async (req, res) => {
+app.delete('/api/media/:mediaId', requireWriter, h(async (req, res) => {
   const { m, story } = loadMedia(req);
   assertEditable(req.user, story);
   db.prepare('DELETE FROM media WHERE id = ?').run(m.id);
@@ -246,13 +261,217 @@ app.delete('/api/media/:mediaId', requireUser, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ---------- Media library (cameraman uploads) ----------
+
+const LIBRARY_TYPES = /^(image|video)\//;
+
+function withFrames(asset) {
+  asset.frames = db.prepare('SELECT id, t, custom FROM frames WHERE asset_id = ? ORDER BY t').all(asset.id);
+  return asset;
+}
+
+function loadAsset(id) {
+  const a = db.prepare('SELECT a.*, u.name AS uploader_name FROM assets a JOIN users u ON u.id = a.uploader_id WHERE a.id = ?').get(Number(id));
+  if (!a) throw new HttpError(404, 'Video or photo not found.');
+  return a;
+}
+
+function loadUpload(req) {
+  const u = db.prepare('SELECT * FROM uploads WHERE id = ?').get(String(req.params.id));
+  if (!u || u.user_id !== req.user.id) throw new HttpError(404, 'Upload not found. Please choose the file again.');
+  return u;
+}
+
+// Resumable upload, step 1: announce the file.
+app.post('/api/uploads', requireUser, h(async (req, res) => {
+  const { name = '', size = 0, mime = '' } = req.body;
+  if (!LIBRARY_TYPES.test(mime)) throw new HttpError(400, `Only videos and photos can go to the media library (${name}).`);
+  if (!(size > 0) || size > MAX_UPLOAD_MB * 1024 * 1024) throw new HttpError(400, `File must be smaller than ${MAX_UPLOAD_MB} MB.`);
+  const id = crypto.randomUUID();
+  db.prepare('INSERT INTO uploads (id, user_id, name, mime, size) VALUES (?,?,?,?,?)').run(id, req.user.id, String(name).slice(0, 200), mime, size);
+  fs.writeFileSync(path.join(PARTIAL_DIR, id), '');
+  res.json({ id, received: 0 });
+}));
+
+// Step 1b: after a network drop, ask how much arrived.
+app.get('/api/uploads/:id', requireUser, h(async (req, res) => {
+  const u = loadUpload(req);
+  res.json({ id: u.id, received: u.received, size: u.size });
+}));
+
+// Step 2: send the next chunk. Upload-Offset must equal the bytes already received.
+app.put('/api/uploads/:id', requireUser, express.raw({ type: () => true, limit: '20mb' }), h(async (req, res) => {
+  const u = loadUpload(req);
+  const offset = Number(req.get('Upload-Offset'));
+  if (offset !== u.received) return res.status(409).json({ error: 'Offset mismatch', received: u.received });
+  const chunk = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  if (u.received + chunk.length > u.size) throw new HttpError(400, 'More data than the announced file size.');
+  await fs.promises.appendFile(path.join(PARTIAL_DIR, u.id), chunk);
+  const received = u.received + chunk.length;
+  db.prepare('UPDATE uploads SET received = ? WHERE id = ?').run(received, u.id);
+  res.json({ received });
+}));
+
+// Step 3: all bytes arrived; add to the library and start processing.
+app.post('/api/uploads/:id/complete', requireUser, h(async (req, res) => {
+  const u = loadUpload(req);
+  if (u.received !== u.size) throw new HttpError(400, `Upload incomplete (${u.received} of ${u.size} bytes).`);
+  const ext = (path.extname(u.name).toLowerCase().match(/^\.[a-z0-9]{1,5}$/) || [''])[0];
+  const file = `${u.id}${ext}`;
+  fs.renameSync(path.join(PARTIAL_DIR, u.id), assetPath(file));
+  db.prepare('DELETE FROM uploads WHERE id = ?').run(u.id);
+  const r = db.prepare('INSERT INTO assets (uploader_id, kind, original_name, original_file, mime, size, note, location) VALUES (?,?,?,?,?,?,?,?)')
+    .run(req.user.id, u.mime.startsWith('video/') ? 'video' : 'image', u.name, file, u.mime, u.size,
+      String(req.body.note || '').slice(0, 2000), String(req.body.location || '').slice(0, 200));
+  const id = Number(r.lastInsertRowid);
+  enqueue(id);
+  res.json({ id });
+}));
+
+app.get('/api/assets', requireUser, (req, res) => {
+  const where = ['1=1'];
+  const params = [];
+  if (req.query.mine === '1' || req.user.role === 'cameraman' && req.query.all !== '1') { where.push('a.uploader_id = ?'); params.push(req.user.id); }
+  if (req.query.kind) { where.push('a.kind = ?'); params.push(String(req.query.kind)); }
+  if (req.query.days) { where.push(`a.created_at >= datetime('now', ?)`); params.push(`-${Number(req.query.days)} days`); }
+  if (req.query.q) {
+    where.push('(a.note LIKE ? OR a.location LIKE ? OR a.original_name LIKE ? OR u.name LIKE ?)');
+    params.push(...Array(4).fill(`%${req.query.q}%`));
+  }
+  res.json(db.prepare(`
+    SELECT a.id, a.kind, a.original_name, a.note, a.location, a.status, a.error, a.duration, a.size, a.created_at,
+      a.original_file IS NOT NULL AS has_original, u.name AS uploader_name,
+      (SELECT f.id FROM frames f WHERE f.asset_id = a.id ORDER BY f.custom, f.t LIMIT 1 OFFSET 0) AS thumb_frame_id,
+      (SELECT COUNT(*) FROM story_assets sa WHERE sa.asset_id = a.id) AS story_count
+    FROM assets a JOIN users u ON u.id = a.uploader_id
+    WHERE ${where.join(' AND ')} ORDER BY a.id DESC LIMIT 200`).all(...params));
+});
+
+app.get('/api/assets/:id', requireUser, h(async (req, res) => {
+  res.json(withFrames(loadAsset(req.params.id)));
+}));
+
+app.patch('/api/assets/:id', requireUser, h(async (req, res) => {
+  const a = loadAsset(req.params.id);
+  if (a.uploader_id !== req.user.id && !isEditor(req.user)) throw new HttpError(403, 'Only the uploader or an editor can change this.');
+  db.prepare('UPDATE assets SET note = COALESCE(?, note), location = COALESCE(?, location) WHERE id = ?')
+    .run(req.body.note ?? null, req.body.location ?? null, a.id);
+  res.json({ ok: true });
+}));
+
+app.delete('/api/assets/:id', requireUser, h(async (req, res) => {
+  const a = loadAsset(req.params.id);
+  const used = db.prepare('SELECT COUNT(*) AS n FROM story_assets WHERE asset_id = ?').get(a.id).n;
+  if (!isEditor(req.user) && (a.uploader_id !== req.user.id || used)) {
+    throw new HttpError(403, used ? 'This is already used in a story. Ask an editor to delete it.' : 'Only the uploader or an editor can delete this.');
+  }
+  const frames = db.prepare('SELECT file FROM frames WHERE asset_id = ?').all(a.id);
+  db.prepare('DELETE FROM assets WHERE id = ?').run(a.id);
+  for (const f of [a.original_file, a.web_file, ...frames.map((x) => x.file)]) if (f) fs.rmSync(assetPath(f), { force: true });
+  res.json({ ok: true });
+}));
+
+app.get('/api/assets/:id/web', requireUser, h(async (req, res) => {
+  const a = loadAsset(req.params.id);
+  if (!a.web_file) throw new HttpError(404, 'Still processing.');
+  res.sendFile(assetPath(a.web_file));
+}));
+
+app.get('/api/assets/:id/original', requireUser, h(async (req, res) => {
+  const a = loadAsset(req.params.id);
+  const file = a.original_file || a.web_file;
+  if (!file) throw new HttpError(404, 'File not available.');
+  const name = a.original_file ? a.original_name : a.original_name.replace(/\.[^.]+$/, '') + path.extname(a.web_file);
+  res.download(assetPath(file), name);
+}));
+
+app.get('/api/frames/:id/file', requireUser, h(async (req, res) => {
+  const f = db.prepare('SELECT file FROM frames WHERE id = ?').get(Number(req.params.id));
+  if (!f) throw new HttpError(404, 'Screenshot not found.');
+  res.set('Cache-Control', 'private, max-age=86400').sendFile(assetPath(f.file));
+}));
+
+// "Use this frame": screenshot at the exact moment the reporter paused the video.
+app.post('/api/assets/:id/frames', requireWriter, h(async (req, res) => {
+  const a = loadAsset(req.params.id);
+  if (a.kind !== 'video' || a.status !== 'ready') throw new HttpError(400, 'Video is not ready yet.');
+  if (!ffmpegAvailable) throw new HttpError(503, 'Screenshots need ffmpeg installed on the server.');
+  const t = Math.min(Math.max(Number(req.body.t) || 0, 0), Math.max(a.duration - 0.05, 0));
+  const id = await grabFrame(a.id, a.web_file, t, true);
+  res.json({ id, t });
+}));
+
+app.post('/api/stories/:id/assets', requireWriter, h(async (req, res) => {
+  const story = loadStory(req);
+  assertEditable(req.user, story);
+  const a = loadAsset(req.body.assetId);
+  db.prepare('INSERT OR IGNORE INTO story_assets (story_id, asset_id) VALUES (?, ?)').run(story.id, a.id);
+  // First video tagged: use its middle screenshot as the photo until the reporter picks one.
+  if (!story.featured_frame_id && !story.featured_asset_id) {
+    const frames = db.prepare('SELECT id FROM frames WHERE asset_id = ? AND custom = 0 ORDER BY t').all(a.id);
+    if (frames.length) db.prepare('UPDATE stories SET featured_frame_id = ? WHERE id = ?').run(frames[Math.floor(frames.length / 2)].id, story.id);
+    else if (a.kind === 'image') db.prepare('UPDATE stories SET featured_asset_id = ? WHERE id = ?').run(a.id, story.id);
+  }
+  res.json({ ok: true });
+}));
+
+app.delete('/api/stories/:id/assets/:assetId', requireWriter, h(async (req, res) => {
+  const story = loadStory(req);
+  assertEditable(req.user, story);
+  const assetId = Number(req.params.assetId);
+  db.prepare('DELETE FROM story_assets WHERE story_id = ? AND asset_id = ?').run(story.id, assetId);
+  db.prepare(`UPDATE stories SET featured_frame_id = NULL WHERE id = ? AND featured_frame_id IN (SELECT id FROM frames WHERE asset_id = ?)`).run(story.id, assetId);
+  db.prepare('UPDATE stories SET featured_asset_id = NULL WHERE id = ? AND featured_asset_id = ?').run(story.id, assetId);
+  res.json({ ok: true });
+}));
+
+/** Files sent to a website: featured photo first (WordPress makes it the main image), then videos and other files. */
+function publishMedia(story, mode) {
+  const files = [];
+  const base = `story-${story.id}`;
+  let featuredAssetId = null;
+  const frame = story.featured_frame_id && db.prepare('SELECT file FROM frames WHERE id = ?').get(story.featured_frame_id);
+  if (frame) {
+    const p = assetPath(frame.file);
+    files.push({ kind: 'image', original_name: `${base}-photo.jpg`, mime: 'image/jpeg', size: fs.statSync(p).size, caption: '', path: p });
+  } else if (story.featured_asset_id) {
+    const a = db.prepare('SELECT * FROM assets WHERE id = ? AND web_file IS NOT NULL').get(story.featured_asset_id);
+    if (a) {
+      featuredAssetId = a.id;
+      files.push({ kind: 'image', original_name: `${base}-photo${path.extname(a.web_file)}`, mime: a.web_file === a.original_file ? a.mime : 'image/jpeg',
+        size: a.web_size, caption: '', path: assetPath(a.web_file) });
+    }
+  }
+  const storyFiles = db.prepare('SELECT * FROM media WHERE story_id = ? ORDER BY id').all(story.id)
+    .map((m) => ({ ...m, path: path.join(UPLOAD_DIR, m.stored_name) }));
+  if (mode === 'photo') {
+    if (!files.length) files.push(...storyFiles.filter((m) => m.kind === 'image').slice(0, 1));
+    return files;
+  }
+  const linked = db.prepare(`SELECT a.* FROM story_assets sa JOIN assets a ON a.id = sa.asset_id
+    WHERE sa.story_id = ? AND a.status = 'ready' ORDER BY a.id`).all(story.id);
+  for (const a of linked) {
+    if (a.id === featuredAssetId) continue;
+    const processed = a.web_file !== a.original_file;
+    files.push({
+      kind: a.kind, size: a.web_size, caption: '', path: assetPath(a.web_file),
+      mime: processed ? (a.kind === 'video' ? 'video/mp4' : 'image/jpeg') : a.mime,
+      original_name: processed ? a.original_name.replace(/\.[^.]+$/, '') + path.extname(a.web_file) : a.original_name,
+    });
+  }
+  return files.concat(storyFiles);
+}
+
 // ---------- Sites & publishing ----------
 
 const SECRET_KEYS = ['appPassword', 'token'];
 const parseSite = (row) => ({ ...row, config: JSON.parse(row.config), enabled: Boolean(row.enabled) });
 
 function publicSite(site, admin) {
-  if (!admin) return { id: site.id, key: site.key, name: site.name, base_url: site.base_url, type: site.type, default_lang: site.default_lang, enabled: site.enabled };
+  if (!admin) {
+    const { id, key, name, base_url, type, default_lang, default_media, enabled } = site;
+    return { id, key, name, base_url, type, default_lang, default_media, enabled };
+  }
   const config = { ...site.config };
   for (const k of SECRET_KEYS) if (config[k]) config[k] = '••••••••';
   return { ...site, config };
@@ -275,14 +494,15 @@ app.patch('/api/sites/:id', requireRole('admin'), h(async (req, res) => {
   const row = db.prepare('SELECT * FROM sites WHERE id = ?').get(Number(req.params.id));
   if (!row) throw new HttpError(404, 'Site not found.');
   const site = parseSite(row);
-  const { name, base_url, type, default_lang, enabled, config = {} } = req.body;
+  const { name, base_url, type, default_lang, default_media, enabled, config = {} } = req.body;
   const merged = { ...site.config };
   for (const [k, v] of Object.entries(config)) {
     if (SECRET_KEYS.includes(k) && v === '••••••••') continue; // unchanged secret
     merged[k] = v;
   }
-  db.prepare('UPDATE sites SET name = ?, base_url = ?, type = ?, default_lang = ?, enabled = ?, config = ? WHERE id = ?').run(
+  db.prepare('UPDATE sites SET name = ?, base_url = ?, type = ?, default_lang = ?, default_media = ?, enabled = ?, config = ? WHERE id = ?').run(
     name ?? site.name, base_url ?? site.base_url, type ?? site.type, default_lang ?? site.default_lang,
+    default_media === 'photo' || default_media === 'all' ? default_media : site.default_media,
     (enabled ?? site.enabled) ? 1 : 0, JSON.stringify(merged), site.id);
   res.json({ ok: true });
 }));
@@ -294,7 +514,7 @@ app.post('/api/sites/:id/test', requireRole('admin'), h(async (req, res) => {
 }));
 
 app.get('/api/settings', requireRole('admin'), (_req, res) => {
-  res.json({ journalistsCanPublish: getSetting('journalistsCanPublish', false) });
+  res.json({ journalistsCanPublish: getSetting('journalistsCanPublish', false), storage: diskUsage(), ffmpeg: ffmpegAvailable });
 });
 
 app.patch('/api/settings', requireRole('admin'), (req, res) => {
@@ -302,12 +522,11 @@ app.patch('/api/settings', requireRole('admin'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/stories/:id/publish', requireUser, h(async (req, res) => {
+app.post('/api/stories/:id/publish', requireWriter, h(async (req, res) => {
   if (!canPublish(req.user)) throw new HttpError(403, 'Only editors can publish. Submit the story for review instead.');
   const story = loadStory(req);
   const targets = Array.isArray(req.body.targets) ? req.body.targets : [];
   if (!targets.length) throw new HttpError(400, 'Choose at least one website.');
-  const media = db.prepare('SELECT * FROM media WHERE story_id = ? ORDER BY id').all(story.id);
   const record = db.prepare(`INSERT INTO publications (story_id, site_id, lang, remote_status, ok, remote_id, remote_url, message, published_by)
     VALUES (?,?,?,?,?,?,?,?,?)`);
 
@@ -318,8 +537,9 @@ app.post('/api/stories/:id/publish', requireUser, h(async (req, res) => {
     const site = parseSite(row);
     const lang = t.lang === 'en' ? 'en' : 'original';
     const status = t.status === 'draft' ? 'draft' : 'publish';
+    const mode = t.media === 'photo' || t.media === 'all' ? t.media : site.default_media;
     try {
-      const out = await publishTo(site, story, lang, media, { status });
+      const out = await publishTo(site, story, lang, publishMedia(story, mode), { status });
       record.run(story.id, site.id, lang, status, 1, out.remoteId, out.url, out.message, req.user.id);
       results.push({ site: site.name, lang, ok: true, ...out });
     } catch (e) {
@@ -343,9 +563,11 @@ app.use((err, _req, res, _next) => {
     return res.status(400).json({ error: msg });
   }
   const status = err.status || 500;
-  if (!(err instanceof HttpError)) console.error(err);
+  if (status >= 500 && !(err instanceof HttpError)) console.error(err);
   res.status(status).json({ error: err instanceof HttpError || status < 500 ? err.message : `Server error: ${err.message}` });
 });
+
+startMediaWorker();
 
 const port = Number(process.env.PORT || 3000);
 if (process.env.NODE_ENV !== 'test') {

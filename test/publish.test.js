@@ -80,7 +80,7 @@ test('publishes to WordPress and a custom CRM with media', async () => {
   assert.equal(story.media[1].original_name, 'ವಿಡಿಯೋ.mp4');
 
   const { results } = await call(`/stories/${id}/publish`, 'POST', {
-    targets: [{ siteId: 1, lang: 'original', status: 'publish' }, { siteId: 2, lang: 'en', status: 'draft' }],
+    targets: [{ siteId: 1, lang: 'original', status: 'publish' }, { siteId: 2, lang: 'en', status: 'draft', media: 'all' }],
   });
   assert.deepEqual(results.map((r) => r.ok), [true, true], JSON.stringify(results));
   assert.equal(results[0].url, 'https://site.test/heavy-rain');
