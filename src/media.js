@@ -24,6 +24,13 @@ function run(cmd, args) {
   });
 }
 
+/** Voiceovers come as webm/ogg/opus from phones; editing software wants AAC (.m4a). Returns false without ffmpeg. */
+export async function convertToM4a(input, output) {
+  if (!ffmpegAvailable) return false;
+  await run('ffmpeg', ['-y', '-i', input, '-vn', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', output]);
+  return true;
+}
+
 async function probeDuration(file) {
   const out = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file]);
   return Number.parseFloat(out) || 0;
@@ -75,8 +82,12 @@ export function enqueue(id) {
 
 /** Remove camera originals once a web version exists and the retention period has passed. */
 export function cleanupOriginals(days = RETENTION_DAYS) {
-  const old = db.prepare(`SELECT id, original_file FROM assets WHERE status = 'ready' AND original_file IS NOT NULL
-    AND web_file IS NOT NULL AND web_file != original_file AND created_at < datetime('now', ?)`).all(`-${days} days`);
+  // Originals tagged to a story still waiting for the video editor are kept (up to 30 days).
+  const old = db.prepare(`SELECT id, original_file FROM assets a WHERE status = 'ready' AND original_file IS NOT NULL
+    AND web_file IS NOT NULL AND web_file != original_file AND created_at < datetime('now', ?)
+    AND (created_at < datetime('now', '-30 days') OR NOT EXISTS (
+      SELECT 1 FROM story_assets sa JOIN video_tasks vt ON vt.story_id = sa.story_id
+      WHERE sa.asset_id = a.id AND vt.status != 'done'))`).all(`-${days} days`);
   for (const a of old) {
     fs.rmSync(assetPath(a.original_file), { force: true });
     db.prepare('UPDATE assets SET original_file = NULL WHERE id = ?').run(a.id);

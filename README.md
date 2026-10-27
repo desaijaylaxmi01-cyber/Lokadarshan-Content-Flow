@@ -7,9 +7,12 @@ A phone-first web app for the Lokadarshan News and Belagavi Insider newsroom. St
 3. **Reporters** open the *Media library*, tag the right video for the story, and tap the best screenshot as the main photo. They can also pause the video and use that exact moment. They write or paste the **headline and script**; *Copy a ready-made prompt* builds a prompt for ChatGPT, Gemini or Claude from the cameraman's notes. Then they add the **Instagram caption, keywords and hashtags**.
 4. **Translate to English** with one click (Claude), then review the result.
 5. **Editors** review, then **publish**. For example, Lokadarshan gets the Kannada story with the main photo and video, and Belagavi Insider gets the English story with the main photo only. Each site can be set to send everything or only the main photo.
-6. *Copy caption + hashtags* and the video download button help with posting to Instagram.
+6. **Voiceover:** the reporter records the narration in the story (*● Record*) or uploads an audio file. The server converts it to `.m4a`, which Premiere, CapCut and similar editors open.
+7. **Video desk:** the reporter taps *Send to video desk* for an Instagram Reel and/or a YouTube video. The **video editor** works on a PC: *Download everything (.zip)* gets the original camera video, voiceover, main photo, scripts, Instagram caption and hashtags, YouTube title, description and tags. After posting, the editor marks each job done with its link. Camera originals are kept until the editing is done (up to 30 days).
+8. When the YouTube link is in, website posts embed the YouTube video instead of uploading the raw clip.
+9. The story list shows every story's status on all four outlets: Instagram, YouTube, Lokadarshan and Belagavi Insider.
 
-Roles: **cameraman** (upload only), **journalist**, **editor** (also publishes), **admin** (also team, websites and storage).
+Roles: **cameraman** (upload only), **journalist**, **video_editor** (video desk and library), **editor** (also publishes), **admin** (also team, websites and storage).
 
 **Install on a phone:** open the site in Chrome on Android, then tap ⋮ → *Add to Home screen* / *Install app*. On iPhone, open it in Safari, then tap Share → *Add to Home Screen*.
 

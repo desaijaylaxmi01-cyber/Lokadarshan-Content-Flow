@@ -30,7 +30,7 @@ const filePath = (m) => m.path || path.join(UPLOAD_DIR, m.stored_name);
 async function dryrun(site, story, article, media, opts) {
   const file = path.join(OUTBOX_DIR, `${site.key}-story${story.id}-${article.language}-${Date.now()}.json`);
   const payload = {
-    site: site.name, status: opts.status, author: story.author_name, sourceStoryId: story.id, ...article,
+    site: site.name, status: opts.status, author: story.author_name, sourceStoryId: story.id, ...article, youtubeUrl: opts.youtubeUrl || '',
     media: media.map((m) => ({ kind: m.kind, name: m.original_name, mime: m.mime, size: m.size, caption: m.caption, path: filePath(m) })),
   };
   fs.writeFileSync(file, JSON.stringify(payload, null, 2));
@@ -94,6 +94,14 @@ async function wordpress(site, story, article, media, opts) {
   const html = [];
   if (article.location) html.push(`<p><strong>${escapeHtml(article.location)}:</strong></p>`);
   html.push(paragraphs(article.body));
+  if (opts.youtubeUrl) {
+    const url = escapeHtml(opts.youtubeUrl);
+    html.push(`<!-- wp:embed {"url":"${url}","type":"video","providerNameSlug":"youtube","responsive":true} -->
+<figure class="wp-block-embed is-type-video is-provider-youtube wp-block-embed-youtube"><div class="wp-block-embed__wrapper">
+${url}
+</div></figure>
+<!-- /wp:embed -->`);
+  }
   for (const m of uploaded) {
     const cap = m.caption ? `<figcaption>${escapeHtml(m.caption)}</figcaption>` : '';
     if (m.kind === 'video') html.push(`<figure class="wp-block-video"><video controls src="${m.url}"></video>${cap}</figure>`);
@@ -128,7 +136,7 @@ async function webhook(site, story, article, media, opts) {
   if (!cfg.endpoint) throw new Error('Webhook connector needs an endpoint URL (Admin → Sites).');
   const form = new FormData();
   form.append('story', JSON.stringify({
-    ...article, status: opts.status, author: story.author_name, sourceStoryId: story.id,
+    ...article, status: opts.status, author: story.author_name, sourceStoryId: story.id, youtubeUrl: opts.youtubeUrl || '',
     media: media.map((m, i) => ({ field: `file${i}`, kind: m.kind, name: m.original_name, caption: m.caption })),
   }));
   for (const [i, m] of media.entries()) {

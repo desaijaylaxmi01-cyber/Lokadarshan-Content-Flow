@@ -1,7 +1,7 @@
 // Makes Newsdesk installable and opens the app shell even on a weak connection.
 // API calls and uploads always go to the network.
-const CACHE = 'newsdesk-v2';
-const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/lib.js', '/library.js', '/uploader.js', '/icon.svg', '/manifest.webmanifest'];
+const CACHE = 'newsdesk-v3';
+const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/lib.js', '/library.js', '/uploader.js', '/videodesk.js', '/icon.svg', '/manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

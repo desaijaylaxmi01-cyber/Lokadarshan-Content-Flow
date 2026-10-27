@@ -1,6 +1,7 @@
 // Newsdesk front end — plain JS, hash routing.
-import { esc, api, toast, fmtSize, fmtDate, badge, CATEGORIES, guard, setUnauthorizedHandler } from './lib.js';
+import { esc, api, toast, fmtSize, fmtDate, badge, CATEGORIES, guard, setUnauthorizedHandler, copyText } from './lib.js';
 import { renderUpload, renderLibrary, renderLinked } from './library.js';
+import { renderVoiceover, renderVideoTasks, renderDesk, renderPackage } from './videodesk.js';
 const $app = document.getElementById('app');
 let me = null;
 setUnauthorizedHandler(() => { me = null; renderLogin(); });
@@ -13,9 +14,16 @@ async function boot() {
   } catch { return; }
   document.getElementById('topbar').hidden = false;
   document.getElementById('user-name').textContent = `${me.user.name} · ${me.user.role}`;
-  const camera = me.user.role === 'cameraman';
-  document.getElementById('nav-admin').hidden = me.user.role !== 'admin';
-  for (const n of ['stories', 'library', 'new']) document.querySelector(`[data-nav=${n}]`).hidden = camera;
+  const role = me.user.role;
+  const show = {
+    upload: role !== 'video_editor',
+    library: role !== 'cameraman',
+    stories: ['journalist', 'editor', 'admin'].includes(role),
+    new: ['journalist', 'editor', 'admin'].includes(role),
+    desk: ['video_editor', 'editor', 'admin'].includes(role),
+    admin: role === 'admin',
+  };
+  for (const [n, visible] of Object.entries(show)) document.querySelector(`[data-nav=${n}]`).hidden = !visible;
   route();
 }
 
@@ -63,10 +71,14 @@ function route() {
   if (!me) return;
   let hash = location.hash.slice(1) || '/';
   if (me.user.role === 'cameraman') hash = '/upload';
-  const nav = { '/admin': 'admin', '/new': 'new', '/upload': 'upload', '/library': 'library' }[hash] || 'stories';
+  if (me.user.role === 'video_editor' && !/^\/(video|library)/.test(hash)) hash = '/video-desk';
+  const nav = hash.startsWith('/video') ? 'desk' : { '/admin': 'admin', '/new': 'new', '/upload': 'upload', '/library': 'library' }[hash] || 'stories';
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === nav));
   const m = hash.match(/^\/story\/(\d+)/);
   if (hash === '/upload') return renderUpload($app);
+  if (hash === '/video-desk') return renderDesk($app);
+  const pkg = hash.match(/^\/video\/(\d+)/);
+  if (pkg) return renderPackage($app, Number(pkg[1]));
   if (hash === '/library') return renderLibrary($app, me);
   if (hash === '/new') return newStory();
   if (m) return renderEditor(Number(m[1]));
@@ -107,8 +119,17 @@ async function renderList() {
   loadList();
 }
 
+let siteNames = null;
+function outletChips(s) {
+  const published = new Set(String(s.published_site_ids || '').split(',').filter(Boolean).map(Number));
+  const task = (label, st) => `<span class="chip ${st === 'done' ? 'on' : st ? 'wip' : ''}" title="${label}: ${st || 'not sent'}">${label}</span>`;
+  return task('IG', s.ig_task) + task('YT', s.yt_task)
+    + siteNames.map((x) => `<span class="chip ${published.has(x.id) ? 'on' : ''}" title="${esc(x.name)}${published.has(x.id) ? ': published' : ''}">${esc(x.short)}</span>`).join('');
+}
+
 async function loadList() {
   const qs = new URLSearchParams({ status: listState.status, q: listState.q, mine: listState.mine ? '1' : '' });
+  siteNames ??= (await api('/sites')).map((x) => ({ id: x.id, name: x.name, short: x.name.split(/\s+/).map((w) => w[0]).join('').toUpperCase().slice(0, 3) }));
   const stories = await api('/stories?' + qs);
   const el = document.getElementById('list');
   if (!el) return;
@@ -116,7 +137,7 @@ async function loadList() {
     el.innerHTML = `<div class="empty">No stories here yet. <a href="#/new">Start a new story</a>.</div>`;
     return;
   }
-  el.innerHTML = `<table><thead><tr><th class="thumb-col"></th><th>Story</th><th class="hide-sm">Reporter</th><th>Status</th><th class="hide-sm">Files</th><th class="hide-sm">Updated</th></tr></thead><tbody>
+  el.innerHTML = `<table><thead><tr><th class="thumb-col"></th><th>Story</th><th class="hide-sm">Reporter</th><th>Status</th><th>Outlets</th><th class="hide-sm">Files</th><th class="hide-sm">Updated</th></tr></thead><tbody>
     ${stories.map((s) => `<tr data-id="${s.id}">
       <td class="thumb-col">${s.featured_frame_id ? `<img src="/api/frames/${s.featured_frame_id}/file" alt="" loading="lazy">`
         : s.featured_asset_id ? `<img src="/api/assets/${s.featured_asset_id}/web" alt="" loading="lazy">` : '<div class="no-thumb"></div>'}</td>
@@ -124,9 +145,13 @@ async function loadList() {
         <div class="story-sub">${s.en_title ? 'EN: ' + esc(s.en_title) : 'Not translated'}${s.category ? ' · ' + esc(s.category) : ''}</div></td>
       <td class="hide-sm">${esc(s.author_name)}</td>
       <td>${badge(s.status)}</td>
+      <td class="chips">${outletChips(s)}</td>
       <td class="hide-sm">${s.media_count + s.asset_count}</td>
       <td class="hide-sm story-sub">${fmtDate(s.updated_at)}</td></tr>`).join('')}
-  </tbody></table>`;
+  </tbody></table>
+  <div class="hint outlet-key">Outlets: <span class="chip">IG</span> Instagram <span class="chip">YT</span> YouTube
+    ${siteNames.map((x) => `<span class="chip">${esc(x.short)}</span> ${esc(x.name)}`).join(' ')}
+    · <span class="chip wip">blue</span> with video desk · <span class="chip on">green</span> done / published</div>`;
   el.querySelector('tbody').onclick = (e) => {
     const tr = e.target.closest('tr');
     if (tr) location.hash = `#/story/${tr.dataset.id}`;
@@ -183,6 +208,8 @@ async function renderEditor(id) {
           </section>
         </div>
 
+        <section class="card stack" id="voiceover"></section>
+
         <section class="card stack">
           <h2>Other files <span class="hint" style="font-weight:400">— documents, data, audio, extra photos</span></h2>
           ${locked ? '' : `<div class="dropzone" id="dropzone">
@@ -204,12 +231,16 @@ async function renderEditor(id) {
           <div><label>Dateline / location</label><input type="text" data-f="location" value="${esc(story.location)}" placeholder="e.g. Belagavi" ${ro}></div>
         </section>
         <section class="card stack">
-          <h2>Instagram &amp; social</h2>
+          <h2>Instagram &amp; YouTube</h2>
           <div><label>Instagram caption</label><textarea data-f="ig_caption" rows="3" ${ro}>${esc(story.ig_caption)}</textarea></div>
           <div><label>Keywords</label><input type="text" data-f="keywords" value="${esc(story.keywords)}" placeholder="belagavi rain, gokak falls" ${ro}></div>
           <div><label>Hashtags</label><input type="text" data-f="hashtags" value="${esc(story.hashtags)}" placeholder="#Belagavi #Karnataka" ${ro}></div>
           <div class="row"><button id="btn-copy-ig">📋 Copy caption + hashtags</button></div>
+          <div><label>YouTube title</label><input type="text" data-f="yt_title" value="${esc(story.yt_title)}" placeholder="Short, searchable title" ${ro}></div>
+          <div><label>YouTube description</label><textarea data-f="yt_description" rows="3" ${ro}>${esc(story.yt_description)}</textarea></div>
+          <div class="hint">YouTube tags use the keywords above.</div>
         </section>
+        <section class="card stack" id="video-tasks"></section>
         <section class="card stack" id="workflow"></section>
         ${story.publications.length ? `<section class="card"><h2>Publishing history</h2><ul class="history" style="padding-left:18px;margin:0">
           ${story.publications.map((p) => `<li><strong>${esc(p.site_name)}</strong> (${p.lang === 'en' ? 'English' : 'original'}, ${esc(p.remote_status)}) —
@@ -235,13 +266,21 @@ async function renderEditor(id) {
   renderMedia(story, locked);
   renderWorkflow(story, sites, editor);
   const linkedEl = document.getElementById('linked');
-  const refreshLinked = async () => {
+  const voiceEl = document.getElementById('voiceover');
+  const tasksEl = document.getElementById('video-tasks');
+  // Re-render the media sections only, so text being typed elsewhere is not disturbed.
+  const refreshParts = async () => {
     await flush(id);
     const fresh = await api(`/stories/${id}`);
-    Object.assign(story, { assets: fresh.assets, featured_frame_id: fresh.featured_frame_id, featured_asset_id: fresh.featured_asset_id });
-    if (document.body.contains(linkedEl)) renderLinked(linkedEl, story, locked, refreshLinked);
+    for (const k of ['assets', 'featured_frame_id', 'featured_asset_id', 'voiceovers', 'video_tasks']) story[k] = fresh[k];
+    if (!document.body.contains(linkedEl)) return;
+    renderLinked(linkedEl, story, locked, refreshParts);
+    renderVoiceover(voiceEl, story, locked, refreshParts);
+    renderVideoTasks(tasksEl, story, refreshParts);
   };
-  renderLinked(linkedEl, story, locked, refreshLinked);
+  renderLinked(linkedEl, story, locked, refreshParts);
+  renderVoiceover(voiceEl, story, locked, refreshParts);
+  renderVideoTasks(tasksEl, story, refreshParts);
 
   document.getElementById('btn-copy-ig').onclick = () => {
     const v = (f) => $app.querySelector(`[data-f=${f}]`).value.trim();
@@ -258,8 +297,10 @@ Give me:
 1. Headline (${lang})
 2. News script (${lang}, 4–8 short paragraphs)
 3. Instagram caption (${lang}, 2–3 lines)
-4. 5 SEO keywords (English)
-5. 10 Instagram hashtags
+4. YouTube title (under 70 characters) and YouTube description (3–4 lines)
+5. 5 SEO keywords (English)
+6. 10 hashtags
+7. A 45–60 second voiceover script (${lang}) for the Instagram Reel
 
 Place: ${v('location') || '[place]'}
 Date: ${new Date().toLocaleDateString('en-IN', { dateStyle: 'long' })}
@@ -292,17 +333,6 @@ ${v('body') ? '\nMy draft so far:\n' + v('body') : ''}`, 'Prompt copied — past
   };
 
   if (!locked) setupUpload(id);
-}
-
-async function copyText(text, message) {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast(message);
-  } catch {
-    const d = document.createElement('textarea');
-    d.value = text; document.body.append(d); d.select(); document.execCommand('copy'); d.remove();
-    toast(message);
-  }
 }
 
 async function flush(id) {
@@ -479,7 +509,7 @@ async function renderAdmin() {
         <div style="overflow-x:auto"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Active</th><th></th></tr></thead><tbody id="users">
           ${users.map((u) => `<tr data-id="${u.id}" style="cursor:default">
             <td>${esc(u.name)}</td><td>${esc(u.email)}</td>
-            <td><select data-role style="width:auto">${['cameraman', 'journalist', 'editor', 'admin'].map((r) => `<option ${u.role === r ? 'selected' : ''}>${r}</option>`).join('')}</select></td>
+            <td><select data-role style="width:auto">${['cameraman', 'journalist', 'video_editor', 'editor', 'admin'].map((r) => `<option ${u.role === r ? 'selected' : ''}>${r}</option>`).join('')}</select></td>
             <td><input type="checkbox" data-active ${u.active ? 'checked' : ''}></td>
             <td><button class="link" data-reset>Reset password</button></td></tr>`).join('')}
         </tbody></table></div>
@@ -487,7 +517,7 @@ async function renderAdmin() {
           <input class="grow" name="name" placeholder="Full name" required>
           <input class="grow" name="email" type="email" placeholder="Email" required>
           <input class="grow" name="password" type="text" placeholder="Temporary password (8+)" minlength="8" required>
-          <select name="role" style="width:auto"><option>cameraman</option><option selected>journalist</option><option>editor</option><option>admin</option></select>
+          <select name="role" style="width:auto"><option>cameraman</option><option selected>journalist</option><option value="video_editor">video editor</option><option>editor</option><option>admin</option></select>
           <button class="primary">Add person</button>
         </form>
       </section>

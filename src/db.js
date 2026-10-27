@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
   name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('cameraman','journalist','editor','admin')),
+  role TEXT NOT NULL CHECK (role IN ('cameraman','journalist','video_editor','editor','admin')),
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -119,6 +119,19 @@ CREATE TABLE IF NOT EXISTS frames (
   t REAL NOT NULL,
   custom INTEGER NOT NULL DEFAULT 0
 );
+-- Instagram / YouTube edit jobs for the video desk.
+CREATE TABLE IF NOT EXISTS video_tasks (
+  id INTEGER PRIMARY KEY,
+  story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+  platform TEXT NOT NULL CHECK (platform IN ('instagram','youtube')),
+  status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('todo','editing','done')),
+  editor_id INTEGER REFERENCES users(id),
+  final_url TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (story_id, platform)
+);
 CREATE TABLE IF NOT EXISTS story_assets (
   story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
   asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -137,14 +150,18 @@ addColumn('stories', 'ig_caption', "TEXT NOT NULL DEFAULT ''");
 addColumn('stories', 'keywords', "TEXT NOT NULL DEFAULT ''");
 addColumn('stories', 'hashtags', "TEXT NOT NULL DEFAULT ''");
 addColumn('stories', 'featured_frame_id', 'INTEGER REFERENCES frames(id) ON DELETE SET NULL');
+addColumn('stories', 'yt_title', "TEXT NOT NULL DEFAULT ''");
+addColumn('stories', 'yt_description', "TEXT NOT NULL DEFAULT ''");
+// '' = file for the website, 'voiceover' = reporter's narration, 'final_instagram' / 'final_youtube' = edited videos.
+addColumn('media', 'purpose', "TEXT NOT NULL DEFAULT ''");
 addColumn('stories', 'featured_asset_id', 'INTEGER REFERENCES assets(id) ON DELETE SET NULL');
 if (addColumn('sites', 'default_media', "TEXT NOT NULL DEFAULT 'all'")) {
   db.prepare("UPDATE sites SET default_media = 'photo' WHERE key = 'belagavi-insider'").run();
 }
 
-// The users.role CHECK constraint gained 'cameraman'; SQLite needs a table rebuild for that.
+// The users.role CHECK constraint gained new roles; SQLite needs a table rebuild for that.
 const usersSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'users'").get().sql;
-if (!usersSql.includes('cameraman')) {
+if (!usersSql.includes('video_editor')) {
   db.exec(`
     PRAGMA foreign_keys = OFF;
     BEGIN;
@@ -153,7 +170,7 @@ if (!usersSql.includes('cameraman')) {
       name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE COLLATE NOCASE,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('cameraman','journalist','editor','admin')),
+      role TEXT NOT NULL CHECK (role IN ('cameraman','journalist','video_editor','editor','admin')),
       active INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );

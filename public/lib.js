@@ -46,3 +46,14 @@ export function modal(html) {
   d.showModal();
   return d;
 }
+
+export async function copyText(text, message) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(message);
+  } catch {
+    const d = document.createElement('textarea');
+    d.value = text; document.body.append(d); d.select(); document.execCommand('copy'); d.remove();
+    toast(message);
+  }
+}

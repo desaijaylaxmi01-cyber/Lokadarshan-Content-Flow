@@ -1,5 +1,6 @@
 import express from 'express';
 import multer from 'multer';
+import archiver from 'archiver';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -10,7 +11,7 @@ import {
 } from './auth.js';
 import { translateStory, translationAvailable, LANGUAGES } from './translate.js';
 import { publishTo, testConnection } from './publishers.js';
-import { enqueue, grabFrame, assetPath, startMediaWorker, diskUsage, ffmpegAvailable } from './media.js';
+import { enqueue, grabFrame, assetPath, startMediaWorker, diskUsage, ffmpegAvailable, convertToM4a } from './media.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -25,6 +26,7 @@ class HttpError extends Error { constructor(status, msg) { super(msg); this.stat
 
 const isEditor = (user) => user.role === 'editor' || user.role === 'admin';
 const requireWriter = requireRole('journalist', 'editor', 'admin');
+const requireVideoDesk = requireRole('video_editor', 'editor', 'admin');
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048);
 const canPublish = (user) => isEditor(user) || getSetting('journalistsCanPublish', false);
 
@@ -73,7 +75,7 @@ app.get('/api/users', requireRole('admin'), (_req, res) => {
 app.post('/api/users', requireRole('admin'), h(async (req, res) => {
   const { name, email, password, role } = req.body;
   if (!name || !email || !password || password.length < 8) throw new HttpError(400, 'Name, email and a password of 8+ characters are required.');
-  if (!['cameraman', 'journalist', 'editor', 'admin'].includes(role)) throw new HttpError(400, 'Invalid role.');
+  if (!['cameraman', 'journalist', 'video_editor', 'editor', 'admin'].includes(role)) throw new HttpError(400, 'Invalid role.');
   try {
     const r = db.prepare('INSERT INTO users (name, email, password_hash, role) VALUES (?,?,?,?)')
       .run(name.trim(), email.trim(), hashPassword(password), role);
@@ -102,8 +104,23 @@ app.patch('/api/users/:id', requireRole('admin'), h(async (req, res) => {
 
 // ---------- Stories ----------
 
+function storyFilesByPurpose(storyId) {
+  const all = db.prepare('SELECT * FROM media WHERE story_id = ? ORDER BY id').all(storyId);
+  return {
+    media: all.filter((m) => m.purpose === ''),
+    voiceovers: all.filter((m) => m.purpose === 'voiceover'),
+    finals: all.filter((m) => m.purpose.startsWith('final_')),
+  };
+}
+
+const videoTasks = (storyId) => db.prepare(`SELECT v.*, u.name AS editor_name FROM video_tasks v
+  LEFT JOIN users u ON u.id = v.editor_id WHERE v.story_id = ? ORDER BY v.platform`).all(storyId);
+
+const youtubeUrl = (storyId) => db.prepare(`SELECT final_url FROM video_tasks
+  WHERE story_id = ? AND platform = 'youtube' AND status = 'done' AND final_url != ''`).get(storyId)?.final_url || '';
+
 const STORY_FIELDS = ['title', 'summary', 'body', 'source_lang', 'category', 'tags', 'location', 'en_title', 'en_summary', 'en_body',
-  'ig_caption', 'keywords', 'hashtags'];
+  'ig_caption', 'keywords', 'hashtags', 'yt_title', 'yt_description'];
 
 function loadStory(req) {
   const story = db.prepare(`SELECT s.*, u.name AS author_name FROM stories s JOIN users u ON u.id = s.author_id WHERE s.id = ?`)
@@ -130,8 +147,12 @@ app.get('/api/stories', requireWriter, (req, res) => {
     SELECT s.id, s.title, s.en_title, s.status, s.category, s.source_lang, s.updated_at, u.name AS author_name,
       s.featured_frame_id, s.featured_asset_id,
       (SELECT COUNT(*) FROM story_assets sa WHERE sa.story_id = s.id) AS asset_count,
-      (SELECT COUNT(*) FROM media m WHERE m.story_id = s.id) AS media_count,
-      (SELECT COUNT(*) FROM publications p WHERE p.story_id = s.id AND p.ok = 1) AS publish_count
+      (SELECT COUNT(*) FROM media m WHERE m.story_id = s.id AND m.purpose = '') AS media_count,
+      (SELECT COUNT(*) FROM media m WHERE m.story_id = s.id AND m.purpose = 'voiceover') AS voiceover_count,
+      (SELECT COUNT(*) FROM publications p WHERE p.story_id = s.id AND p.ok = 1) AS publish_count,
+      (SELECT GROUP_CONCAT(DISTINCT p.site_id) FROM publications p WHERE p.story_id = s.id AND p.ok = 1) AS published_site_ids,
+      (SELECT status FROM video_tasks v WHERE v.story_id = s.id AND v.platform = 'instagram') AS ig_task,
+      (SELECT status FROM video_tasks v WHERE v.story_id = s.id AND v.platform = 'youtube') AS yt_task
     FROM stories s JOIN users u ON u.id = s.author_id
     WHERE ${where} ORDER BY s.updated_at DESC LIMIT 200`).all(...params));
 });
@@ -143,7 +164,8 @@ app.post('/api/stories', requireWriter, (req, res) => {
 
 app.get('/api/stories/:id', requireWriter, h(async (req, res) => {
   const story = loadStory(req);
-  story.media = db.prepare('SELECT * FROM media WHERE story_id = ? ORDER BY id').all(story.id);
+  Object.assign(story, storyFilesByPurpose(story.id));
+  story.video_tasks = videoTasks(story.id);
   story.assets = db.prepare(`SELECT a.*, u.name AS uploader_name FROM story_assets sa JOIN assets a ON a.id = sa.asset_id
     JOIN users u ON u.id = a.uploader_id WHERE sa.story_id = ? ORDER BY a.id`).all(story.id).map(withFrames);
   story.publications = db.prepare(`
@@ -442,7 +464,7 @@ function publishMedia(story, mode) {
         size: a.web_size, caption: '', path: assetPath(a.web_file) });
     }
   }
-  const storyFiles = db.prepare('SELECT * FROM media WHERE story_id = ? ORDER BY id').all(story.id)
+  const storyFiles = db.prepare("SELECT * FROM media WHERE story_id = ? AND purpose = '' ORDER BY id").all(story.id)
     .map((m) => ({ ...m, path: path.join(UPLOAD_DIR, m.stored_name) }));
   if (mode === 'photo') {
     if (!files.length) files.push(...storyFiles.filter((m) => m.kind === 'image').slice(0, 1));
@@ -450,8 +472,10 @@ function publishMedia(story, mode) {
   }
   const linked = db.prepare(`SELECT a.* FROM story_assets sa JOIN assets a ON a.id = sa.asset_id
     WHERE sa.story_id = ? AND a.status = 'ready' ORDER BY a.id`).all(story.id);
+  const embedYoutube = Boolean(youtubeUrl(story.id));
   for (const a of linked) {
     if (a.id === featuredAssetId) continue;
+    if (a.kind === 'video' && embedYoutube) continue; // the website embeds the YouTube video instead
     const processed = a.web_file !== a.original_file;
     files.push({
       kind: a.kind, size: a.web_size, caption: '', path: assetPath(a.web_file),
@@ -461,6 +485,173 @@ function publishMedia(story, mode) {
   }
   return files.concat(storyFiles);
 }
+
+// ---------- Voiceover (reporter) ----------
+
+const voiceUpload = multer({
+  storage: multer.diskStorage({
+    destination: UPLOAD_DIR,
+    filename: (_req, file, cb) => cb(null, crypto.randomUUID() + (path.extname(file.originalname).toLowerCase() || '.webm')),
+  }),
+  limits: { fileSize: 500 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => cb(/^(audio|video)\//.test(file.mimetype) ? null : new HttpError(400, 'Please choose an audio file.'), true),
+});
+
+app.post('/api/stories/:id/voiceover', requireWriter, (req, _res, next) => {
+  try { assertEditable(req.user, loadStory(req)); next(); } catch (e) { next(e); }
+}, voiceUpload.single('file'), h(async (req, res) => {
+  const f = req.file;
+  if (!f) throw new HttpError(400, 'No audio received.');
+  const storyId = Number(req.params.id);
+  const n = db.prepare("SELECT COUNT(*) AS n FROM media WHERE story_id = ? AND purpose = 'voiceover'").get(storyId).n + 1;
+  let stored = f.filename, mime = f.mimetype, size = f.size;
+  const m4a = `${path.parse(f.filename).name}.m4a`;
+  try {
+    if (path.extname(f.filename) !== '.m4a' && await convertToM4a(f.path, path.join(UPLOAD_DIR, m4a))) {
+      fs.rmSync(f.path, { force: true });
+      stored = m4a; mime = 'audio/mp4'; size = fs.statSync(path.join(UPLOAD_DIR, m4a)).size;
+    }
+  } catch (e) {
+    console.error('Voiceover conversion failed, keeping original:', e.message);
+  }
+  db.prepare(`INSERT INTO media (story_id, kind, original_name, stored_name, mime, size, purpose, caption) VALUES (?,?,?,?,?,?,?,?)`)
+    .run(storyId, 'audio', `voiceover-${n}${path.extname(stored)}`, stored, mime, size, 'voiceover', String(req.body.label || ''));
+  db.prepare(`UPDATE stories SET updated_at = datetime('now') WHERE id = ?`).run(storyId);
+  res.json({ ok: true });
+}));
+
+// ---------- Video desk (Instagram / YouTube editing) ----------
+
+app.post('/api/stories/:id/video-tasks', requireWriter, h(async (req, res) => {
+  const story = loadStory(req);
+  const platforms = (req.body.platforms || []).filter((p) => p === 'instagram' || p === 'youtube');
+  if (!platforms.length) throw new HttpError(400, 'Choose Instagram and/or YouTube.');
+  const add = db.prepare('INSERT OR IGNORE INTO video_tasks (story_id, platform, note) VALUES (?, ?, ?)');
+  for (const p of platforms) add.run(story.id, p, String(req.body.note || ''));
+  res.json({ ok: true });
+}));
+
+app.delete('/api/video-tasks/:id', requireWriter, h(async (req, res) => {
+  const t = db.prepare('SELECT * FROM video_tasks WHERE id = ?').get(Number(req.params.id));
+  if (!t) throw new HttpError(404, 'Task not found.');
+  loadStory({ ...req, params: { id: t.story_id } });
+  if (t.status !== 'todo' && !isEditor(req.user)) throw new HttpError(403, 'The video editor has already started this.');
+  db.prepare('DELETE FROM video_tasks WHERE id = ?').run(t.id);
+  res.json({ ok: true });
+}));
+
+app.patch('/api/video-tasks/:id', requireVideoDesk, h(async (req, res) => {
+  const t = db.prepare('SELECT * FROM video_tasks WHERE id = ?').get(Number(req.params.id));
+  if (!t) throw new HttpError(404, 'Task not found.');
+  const status = ['todo', 'editing', 'done'].includes(req.body.status) ? req.body.status : t.status;
+  const finalUrl = typeof req.body.final_url === 'string' ? req.body.final_url.trim() : t.final_url;
+  if (finalUrl && !/^https?:\/\//i.test(finalUrl)) throw new HttpError(400, 'The link must start with https://');
+  const editorId = status === 'todo' ? null : (t.editor_id || req.user.id);
+  db.prepare(`UPDATE video_tasks SET status = ?, final_url = ?, editor_id = ?, updated_at = datetime('now') WHERE id = ?`)
+    .run(status, finalUrl, editorId, t.id);
+  res.json({ ok: true });
+}));
+
+app.get('/api/video-desk', requireVideoDesk, (req, res) => {
+  const rows = db.prepare(`
+    SELECT s.id, s.title, s.en_title, s.location, s.featured_frame_id, s.featured_asset_id, u.name AS author_name,
+      MIN(v.created_at) AS sent_at, MAX(v.updated_at) AS updated_at,
+      (SELECT COUNT(*) FROM media m WHERE m.story_id = s.id AND m.purpose = 'voiceover') AS voiceover_count,
+      (SELECT COUNT(*) FROM story_assets sa JOIN assets a ON a.id = sa.asset_id WHERE sa.story_id = s.id AND a.kind = 'video') AS video_count
+    FROM video_tasks v JOIN stories s ON s.id = v.story_id JOIN users u ON u.id = s.author_id
+    GROUP BY s.id ORDER BY MIN(v.status = 'done'), sent_at DESC LIMIT 200`).all();
+  for (const r of rows) r.tasks = videoTasks(r.id);
+  res.json(rows);
+});
+
+function loadDeskStory(req) {
+  const story = db.prepare(`SELECT s.*, u.name AS author_name FROM stories s JOIN users u ON u.id = s.author_id WHERE s.id = ?`)
+    .get(Number(req.params.id));
+  if (!story) throw new HttpError(404, 'Story not found.');
+  if (!isEditor(req.user) && !db.prepare('SELECT 1 FROM video_tasks WHERE story_id = ?').get(story.id)) {
+    throw new HttpError(403, 'This story has not been sent to the video desk.');
+  }
+  return story;
+}
+
+app.get('/api/video-desk/:id', requireVideoDesk, h(async (req, res) => {
+  const story = loadDeskStory(req);
+  Object.assign(story, storyFilesByPurpose(story.id));
+  story.video_tasks = videoTasks(story.id);
+  story.assets = db.prepare(`SELECT a.*, u.name AS uploader_name FROM story_assets sa JOIN assets a ON a.id = sa.asset_id
+    JOIN users u ON u.id = a.uploader_id WHERE sa.story_id = ? ORDER BY a.id`).all(story.id).map(withFrames);
+  res.json(story);
+}));
+
+app.get('/api/video-desk/:id/media/:mediaId', requireVideoDesk, h(async (req, res) => {
+  const story = loadDeskStory(req);
+  const m = db.prepare('SELECT * FROM media WHERE id = ? AND story_id = ?').get(Number(req.params.mediaId), story.id);
+  if (!m) throw new HttpError(404, 'File not found.');
+  res.type(m.mime);
+  res.sendFile(path.join(UPLOAD_DIR, m.stored_name), { headers: { 'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(m.original_name)}` } });
+}));
+
+const BOM = '﻿';
+const block = (...lines) => BOM + lines.filter((l) => l !== null).join('\r\n') + '\r\n';
+
+/** Everything the video editor needs for one story, as a single ZIP. Videos are stored, not re-compressed. */
+app.get('/api/video-desk/:id/package.zip', requireVideoDesk, h(async (req, res) => {
+  const story = loadDeskStory(req);
+  const dir = `story-${story.id}`;
+  const lang = LANGUAGES[story.source_lang] || 'Original';
+  const assets = db.prepare(`SELECT a.*, u.name AS uploader_name FROM story_assets sa JOIN assets a ON a.id = sa.asset_id
+    JOIN users u ON u.id = a.uploader_id WHERE sa.story_id = ? AND a.status != 'failed' ORDER BY a.id`).all(story.id);
+  const { voiceovers, media } = storyFilesByPurpose(story.id);
+
+  res.attachment(`${dir}.zip`);
+  const zip = archiver('zip', { store: true });
+  zip.on('error', (e) => { console.error('ZIP failed:', e.message); res.destroy(e); });
+  zip.pipe(res);
+
+  let v = 0, p = 0;
+  for (const a of assets) {
+    const file = a.original_file || a.web_file;
+    if (!file) continue;
+    const ext = path.extname(file);
+    const name = a.kind === 'video' ? `video-${++v}${ext}` : `photo-${++p}${ext}`;
+    zip.file(assetPath(file), { name: `${dir}/${name}` });
+  }
+  const frame = story.featured_frame_id && db.prepare('SELECT file FROM frames WHERE id = ?').get(story.featured_frame_id);
+  if (frame) zip.file(assetPath(frame.file), { name: `${dir}/main-photo.jpg` });
+  voiceovers.forEach((m, i) => zip.file(path.join(UPLOAD_DIR, m.stored_name), { name: `${dir}/voiceover-${i + 1}${path.extname(m.stored_name)}` }));
+  for (const m of media) zip.file(path.join(UPLOAD_DIR, m.stored_name), { name: `${dir}/other-files/${m.original_name}` });
+
+  zip.append(block(`${lang.toUpperCase()} SCRIPT`, '', story.title, '', story.summary || null, story.summary ? '' : null, story.body), { name: `${dir}/script-${lang.toLowerCase()}.txt` });
+  if (story.en_title || story.en_body) zip.append(block('ENGLISH SCRIPT', '', story.en_title, '', story.en_summary || null, story.en_summary ? '' : null, story.en_body), { name: `${dir}/script-english.txt` });
+  zip.append(block('INSTAGRAM', '', 'Caption:', story.ig_caption, '', 'Hashtags:', story.hashtags, '', 'Keywords:', story.keywords), { name: `${dir}/instagram.txt` });
+  zip.append(block('YOUTUBE', '', 'Title:', story.yt_title || story.en_title || story.title, '', 'Description:', story.yt_description || story.summary,
+    '', 'Tags:', story.keywords, '', 'Hashtags:', story.hashtags), { name: `${dir}/youtube.txt` });
+  zip.append(block(`Story #${story.id}: ${story.title}`, `Reporter: ${story.author_name}`, `Place: ${story.location}`, '',
+    'Camera notes:', ...assets.map((a) => `- ${a.kind} by ${a.uploader_name}: ${a.note || a.original_name}${a.location ? ' (' + a.location + ')' : ''}`),
+    '', ...videoTasks(story.id).map((t) => `${t.platform}: ${t.status}${t.note ? ' — ' + t.note : ''}`)), { name: `${dir}/README.txt` });
+  await zip.finalize();
+}));
+
+const finalUpload = multer({
+  storage: multer.diskStorage({
+    destination: UPLOAD_DIR,
+    filename: (_req, file, cb) => cb(null, crypto.randomUUID() + path.extname(file.originalname).toLowerCase()),
+  }),
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => cb(/^video\//.test(file.mimetype) ? null : new HttpError(400, 'Please choose a video file.'), true),
+});
+
+// Optional: the editor uploads the finished Reel / YouTube video so others can post or archive it.
+app.post('/api/video-desk/:id/final/:platform', requireVideoDesk, (req, _res, next) => {
+  try { loadDeskStory(req); next(); } catch (e) { next(e); }
+}, finalUpload.single('file'), h(async (req, res) => {
+  const platform = req.params.platform === 'youtube' ? 'youtube' : 'instagram';
+  const f = req.file;
+  if (!f) throw new HttpError(400, 'No video received.');
+  db.prepare(`INSERT INTO media (story_id, kind, original_name, stored_name, mime, size, purpose) VALUES (?,?,?,?,?,?,?)`)
+    .run(Number(req.params.id), 'video', Buffer.from(f.originalname, 'latin1').toString('utf8'), f.filename, f.mimetype, f.size, `final_${platform}`);
+  res.json({ ok: true });
+}));
 
 // ---------- Sites & publishing ----------
 
@@ -539,7 +730,7 @@ app.post('/api/stories/:id/publish', requireWriter, h(async (req, res) => {
     const status = t.status === 'draft' ? 'draft' : 'publish';
     const mode = t.media === 'photo' || t.media === 'all' ? t.media : site.default_media;
     try {
-      const out = await publishTo(site, story, lang, publishMedia(story, mode), { status });
+      const out = await publishTo(site, story, lang, publishMedia(story, mode), { status, youtubeUrl: mode === 'all' ? youtubeUrl(story.id) : '' });
       record.run(story.id, site.id, lang, status, 1, out.remoteId, out.url, out.message, req.user.id);
       results.push({ site: site.name, lang, ok: true, ...out });
     } catch (e) {
