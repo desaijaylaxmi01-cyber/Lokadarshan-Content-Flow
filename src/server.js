@@ -13,6 +13,7 @@ import { publishTo, testConnection } from './publishers.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+app.set('trust proxy', 'loopback'); // behind Nginx: lets req.secure see HTTPS so cookies are marked Secure
 app.use(express.json({ limit: '5mb' }));
 app.use(sessionMiddleware(db));
 app.use(express.static(path.join(here, '..', 'public')));

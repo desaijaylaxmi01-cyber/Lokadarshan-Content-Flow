@@ -46,7 +46,16 @@ Click **Save & test connection** to check the credentials before going live.
 
 ## Deploying
 
-- Run it on any VPS or cloud VM with Node 22 (for example behind Nginx with HTTPS). Set Nginx `client_max_body_size` to at least `MAX_UPLOAD_MB`.
+On a fresh Ubuntu 22.04 or 24.04 server, first point a DNS record (for example `desk.lokadarshan.news`) to the server's IP address. Then run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/desaijaylaxmi01-cyber/Lokadarshan-Content-Flow/main/deploy/install.sh -o install.sh
+sudo bash install.sh desk.lokadarshan.news you@example.com
+```
+
+The script installs Node.js 22 and Nginx, gets a free HTTPS certificate, runs the portal as a service that restarts automatically, and prints the admin password. To install later updates from GitHub, run `sudo bash /opt/newsdesk/deploy/update.sh`.
+
+- To deploy by hand instead, run it on any VPS or cloud VM with Node 22, behind Nginx with HTTPS. Set Nginx `client_max_body_size` to at least `MAX_UPLOAD_MB`.
 - Back up the `data/` folder. It holds the SQLite database and every uploaded file.
 - Use HTTPS in production so session cookies and the stored site credentials are protected in transit.
 
